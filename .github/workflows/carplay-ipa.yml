@@ -1,0 +1,103 @@
+name: CarPlay IPA
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Marketing version (leave empty to use the latest tag)"
+        required: false
+        default: ""
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+      - name: Enable CarPlay overlay
+        run: |
+          chmod +x Scripts/*.sh || true
+          Scripts/configure-ios.sh --carplay
+          test -f "Sources/iOS&iPadOS/Config/Generated/CodaIOS-CarPlay.entitlements"
+          test -f "Sources/iOS&iPadOS/Config/Generated/Info-CarPlay.plist"
+      - name: Resolve version
+        id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          V="${INPUT_VERSION}"
+          if [ -z "$V" ]; then
+            V="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
+          fi
+          [ -n "$V" ] || V="0.1.2"
+          B="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "build=$B" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$V BUILD=$B"
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace ios/CodaIOS.xcworkspace \
+            -scheme CodaIOS \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            MARKETING_VERSION="${{ steps.v.outputs.version }}" \
+            CURRENT_PROJECT_VERSION="${{ steps.v.outputs.build }}" \
+            build 2>&1 | tee build-xcodebuild.log | tail -n 40
+      - name: Ad-hoc sign with CarPlay entitlement
+        run: |
+          APP="$(ls -d build/dd/Build/Products/Release-iphoneos/*.app | head -n 1)"
+          ENT="Sources/iOS&iPadOS/Config/Generated/CodaIOS-CarPlay.entitlements"
+          echo "APP=$APP"
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" \( -name '*.framework' -o -name '*.dylib' \) -print | while read -r item; do
+              codesign --force --sign - --timestamp=none "$item"
+            done
+          fi
+          codesign --force --sign - --timestamp=none --entitlements "$ENT" "$APP"
+          codesign --verify --verbose=2 "$APP"
+      - name: Verify CarPlay wiring
+        run: |
+          APP="$(ls -d build/dd/Build/Products/Release-iphoneos/*.app | head -n 1)"
+          PL="$APP/Info.plist"
+          codesign -d --entitlements :- "$APP" 2>&1 | tee /tmp/ent.txt
+          grep -q 'carplay-audio' /tmp/ent.txt || { echo "::error::carplay-audio missing from signature"; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print :UISupportsCarPlay' "$PL"
+          /usr/libexec/PlistBuddy -c 'Print :UISupportsCarPlay' "$PL" | grep -qi true
+          /usr/libexec/PlistBuddy -c 'Print :UIApplicationSceneManifest:UISceneConfigurations:CPTemplateApplicationSceneSessionRoleApplication:0:UISceneDelegateClassName' "$PL"
+          echo "CarPlay entitlement and scene declaration present"
+      - name: Package IPA
+        run: |
+          APP="$(ls -d build/dd/Build/Products/Release-iphoneos/*.app | head -n 1)"
+          V="${{ steps.v.outputs.version }}"
+          mkdir -p out/payload/Payload
+          ditto "$APP" "out/payload/Payload/$(basename "$APP")"
+          ( cd out/payload && zip -qry -X "../Coda-iOS-$V-carplay.ipa" Payload )
+          shasum -a 256 "out/Coda-iOS-$V-carplay.ipa"
+          ls -lh out/
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: coda-carplay-ipa
+          path: out/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build-xcodebuild.log
+          if-no-files-found: ignore
