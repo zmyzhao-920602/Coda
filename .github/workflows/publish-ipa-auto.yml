@@ -1,0 +1,44 @@
+name: Publish IPA Auto
+
+# One-shot helper: republishes the already-built CarPlay IPA as a public Release
+# asset. Triggered by push, because the manual "Run workflow" dialog needs a
+# GitHub endpoint that is unreachable on this network.
+#
+# Release assets are served from objects.githubusercontent.com (reachable),
+# unlike artifacts which redirect to pipelines.actions.githubusercontent.com
+# (blocked here).
+
+on:
+  push:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Download the artifact from the successful build run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p out
+          gh run download 45806991050 -R "${{ github.repository }}" -n coda-carplay-ipa -D out
+          echo "--- files ---"
+          find out -type f -exec ls -lh {} \;
+
+      - name: Publish as release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="carplay-ipa-8392100"
+          gh release delete "$TAG" -R "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" out/*.ipa \
+            -R "${{ github.repository }}" \
+            --title "Coda CarPlay IPA" \
+            --notes "CarPlay-enabled IPA (ad-hoc signed with com.apple.developer.carplay-audio). Install with TrollStore."
+          echo "--- assets ---"
+          gh release view "$TAG" -R "${{ github.repository }}" --json assets --jq '.assets[] | "\(.name) \(.size)"'
