@@ -14,6 +14,9 @@ struct CodaIOSApp: App {
     var body: some Scene {
         WindowGroup {
             IOSMainWindow()
+                .overlay(alignment: .topTrailing) {
+                    CarPlayDebugButton()
+                }
         }
     }
 }
@@ -27,8 +30,8 @@ final class DownloadAppDelegate: NSObject, UIApplicationDelegate {
 
 // MARK: - Diagnostics
 
-/// Plain-text log in the app's Documents folder, reachable through the Files app.
-/// `.ips` reports never carry an NSException reason, so we record failures ourselves.
+/// Plain-text log in the app's Documents folder, also viewable in-app through the
+/// stethoscope button (top-right) so it can be read without the Files app.
 enum CarPlayDiag {
     static let fileName = "carplay-diag.log"
 
@@ -50,10 +53,59 @@ enum CarPlayDiag {
         }
     }
 
+    static func read() -> String {
+        (try? String(contentsOf: logURL, encoding: .utf8)) ?? "<还没有日志文件：\(logURL.path)>"
+    }
+
     static func installExceptionHandler() {
         NSSetUncaughtExceptionHandler { exception in
             CarPlayDiag.log("UNCAUGHT \(exception.name.rawValue): \(exception.reason ?? "<no reason>")")
             CarPlayDiag.log("STACK:\n" + exception.callStackSymbols.joined(separator: "\n"))
+        }
+    }
+}
+
+struct CarPlayDebugButton: View {
+    @State private var showing = false
+
+    var body: some View {
+        Button {
+            showing = true
+        } label: {
+            Image(systemName: "stethoscope")
+                .font(.system(size: 15, weight: .semibold))
+                .padding(9)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .padding(10)
+        .sheet(isPresented: $showing) { CarPlayDebugView() }
+    }
+}
+
+struct CarPlayDebugView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                Text(text)
+                    .font(.system(.caption2, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                    .textSelection(.enabled)
+            }
+            .navigationTitle("CarPlay 诊断")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("刷新") { text = CarPlayDiag.read() }
+                }
+            }
+            .onAppear { text = CarPlayDiag.read() }
         }
     }
 }
@@ -65,20 +117,11 @@ import UIKit
 
 /// CarPlay template scene delegate.
 ///
-/// Deliberately implements ONLY the two-argument `didConnect interfaceController:`
-/// variant. Evidence from two crash reports on iOS 16.5:
-///
-///  * two-argument (v1): CarPlay delivers the interface controller, the app installs a
-///    CPTabBarTemplate, and then Apple's CarPlayTemplateUIHost crashes while building
-///    the tab bar (`-[UITabBar setDelegate:]` ← `_prepareTabBar` ← `_UIAppearance`),
-///    which the user sees as a black screen;
-///  * three-argument (v2): CarPlay aborts inside `_deliverInterfaceControllerToDelegate`
-///    while assembling its userInfo dictionary — audio apps have no CPWindow, so that
-///    path is unusable here.
-///
-/// So: keep the two-argument method, and find out what the host chokes on.
+/// Only the two-argument `didConnect interfaceController:` variant is implemented:
+/// on iOS 16.5 the three-argument variant aborts inside CarPlay's own delivery step
+/// because audio apps have no CPWindow.
 final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
-    /// `UIScene.delegate` is weak; nothing else retains this object.
+    /// `UIScene.delegate` is weak, and nothing in a SwiftUI lifecycle retains this object.
     nonisolated(unsafe) static var strongRetain: CarPlaySceneDelegate?
 
     private var didStart = false
@@ -127,17 +170,12 @@ extension CarPlaySceneDelegate {
     }
 
     private func boot(_ controller: CPInterfaceController, window: CPWindow) {
-        // Step 1: a plain list template. If this renders on the head unit, the scene
-        // plumbing is fine and the tab bar template is what upsets the host.
         CarPlayDiag.log("step1: installing placeholder CPListTemplate")
         let placeholder = CPListTemplate(title: "Coda", sections: [])
         placeholder.emptyViewTitleVariants = ["Coda 正在连接…"]
         controller.setRootTemplate(placeholder, animated: false, completion: nil)
         CarPlayDiag.log("step1: placeholder installed")
 
-        // Step 2: hand over to the real connector, which installs a CPTabBarTemplate.
-        // Running it a few seconds later keeps the two experiments distinguishable in
-        // the log (and lets the placeholder paint first if the host survives).
         CarPlayDiag.log("step2: scheduling CarPlayConnector in 5s")
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 5_000_000_000)
