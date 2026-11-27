@@ -29,13 +29,18 @@ import UIKit
 final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {}
 
 extension CarPlaySceneDelegate {
+    // iOS 14+ (including 16.5) calls the three-argument variant that carries a CPWindow.
+    // The old two-argument `didConnect interfaceController:` form is a leftover iOS 13
+    // signature: it is no longer part of the protocol, so it is never invoked and the
+    // root template is never installed — which is exactly why CarPlay showed a black screen.
     func templateApplicationScene(
         _ scene: CPTemplateApplicationScene,
-        didConnect interfaceController: CPInterfaceController
+        didConnect interfaceController: CPInterfaceController,
+        to window: CPWindow
     ) {
         CarPlayConnector.shared.didConnect(
             interfaceController: interfaceController,
-            window: scene.carWindow
+            window: window
         )
     }
 
