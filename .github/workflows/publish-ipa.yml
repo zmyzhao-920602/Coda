@@ -1,0 +1,49 @@
+name: Publish IPA
+
+# Takes the artifact produced by an earlier "CarPlay IPA" run and republishes it
+# as a public GitHub Release asset. Reason: artifact downloads redirect to
+# pipelines.actions.githubusercontent.com, which is unreachable on this network,
+# while release assets come from objects.githubusercontent.com, which works.
+#
+# No rebuild: it just downloads the existing artifact and attaches it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Run id that produced the coda-carplay-ipa artifact"
+        required: true
+        default: "45806991050"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Download artifact from the earlier run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p out
+          gh run download "${{ inputs.run_id }}" -R "${{ github.repository }}" -n coda-carplay-ipa -D out
+          echo "--- downloaded ---"
+          find out -type f -exec ls -lh {} \;
+
+      - name: Create release with the IPA attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="carplay-ipa-${{ inputs.run_id }}"
+          gh release delete "$TAG" -R "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" out/*.ipa \
+            -R "${{ github.repository }}" \
+            --title "Coda CarPlay IPA (build ${{ inputs.run_id }})" \
+            --notes "CarPlay-enabled IPA built by CI, source run: ${{ inputs.run_id }}. Signed ad-hoc with com.apple.developer.carplay-audio; install via TrollStore."
+          echo "--- release assets ---"
+          gh release view "$TAG" -R "${{ github.repository }}" --json assets \
+            --jq '.assets[] | "\(.name) \(.size) bytes\n\(.url)"'
