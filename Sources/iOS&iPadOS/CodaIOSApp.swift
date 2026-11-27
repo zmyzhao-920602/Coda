@@ -7,7 +7,8 @@ struct CodaIOSApp: App {
 
     init() {
         CarPlayDiag.installExceptionHandler()
-        CarPlayDiag.log("app launched, version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
+        let info = Bundle.main.infoDictionary
+        CarPlayDiag.log("app launched, version \(info?["CFBundleShortVersionString"] as? String ?? "?") build \(info?["CFBundleVersion"] as? String ?? "?")")
     }
 
     var body: some Scene {
@@ -26,9 +27,8 @@ final class DownloadAppDelegate: NSObject, UIApplicationDelegate {
 
 // MARK: - Diagnostics
 
-/// Writes a plain-text log into the app's Documents folder so it can be pulled off
-/// the device through the Files app (UIFileSharingEnabled is set in Info.plist).
-/// Goal: capture the CarPlay-side NSException reason, which .ips crash reports omit.
+/// Plain-text log in the app's Documents folder, reachable through the Files app.
+/// `.ips` reports never carry an NSException reason, so we record failures ourselves.
 enum CarPlayDiag {
     static let fileName = "carplay-diag.log"
 
@@ -40,8 +40,7 @@ enum CarPlayDiag {
 
     static func log(_ message: String) {
         let stamp = ISO8601DateFormatter().string(from: Date())
-        let line = "[\(stamp)] \(message)\n"
-        guard let data = line.data(using: .utf8) else { return }
+        guard let data = ("[\(stamp)] \(message)\n").data(using: .utf8) else { return }
         if let handle = try? FileHandle(forWritingTo: logURL) {
             handle.seekToEndOfFile()
             handle.write(data)
@@ -64,20 +63,40 @@ enum CarPlayDiag {
 import CarPlay
 import UIKit
 
-/// CarPlay template scene delegate — instantiated automatically by UIApplicationSceneManifest in Info.plist.
-/// It just forwards the connect/disconnect callbacks into `CarPlayConnector` inside CodaCore;
-/// the app target itself stays as a thin bridge and owns no CarPlay logic of its own.
+/// CarPlay template scene delegate.
+///
+/// Deliberately implements ONLY the two-argument `didConnect interfaceController:`
+/// variant. Evidence from two crash reports on iOS 16.5:
+///
+///  * two-argument (v1): CarPlay delivers the interface controller, the app installs a
+///    CPTabBarTemplate, and then Apple's CarPlayTemplateUIHost crashes while building
+///    the tab bar (`-[UITabBar setDelegate:]` ← `_prepareTabBar` ← `_UIAppearance`),
+///    which the user sees as a black screen;
+///  * three-argument (v2): CarPlay aborts inside `_deliverInterfaceControllerToDelegate`
+///    while assembling its userInfo dictionary — audio apps have no CPWindow, so that
+///    path is unusable here.
+///
+/// So: keep the two-argument method, and find out what the host chokes on.
 final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
+    /// `UIScene.delegate` is weak; nothing else retains this object.
+    nonisolated(unsafe) static var strongRetain: CarPlaySceneDelegate?
+
     private var didStart = false
+    private var interfaceController: CPInterfaceController?
 
     override init() {
         super.init()
-        CarPlayDiag.log("CarPlaySceneDelegate init")
+        CarPlaySceneDelegate.strongRetain = self
+        CarPlayDiag.log("CarPlaySceneDelegate init (retained)")
+    }
+
+    deinit {
+        CarPlayDiag.log("CarPlaySceneDelegate deinit")
     }
 
     fileprivate func startOnce(_ label: String, _ body: () -> Void) {
         if didStart {
-            CarPlayDiag.log("\(label): already started, ignoring duplicate callback")
+            CarPlayDiag.log("\(label): duplicate callback ignored")
             return
         }
         didStart = true
@@ -86,26 +105,13 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
 }
 
 extension CarPlaySceneDelegate {
-    // iOS 14+ variant. Apple's navigation apps receive this one; whether audio apps
-    // get it (with a nil window) is exactly what we are trying to establish.
-    func templateApplicationScene(
-        _ scene: CPTemplateApplicationScene,
-        didConnect interfaceController: CPInterfaceController,
-        to window: CPWindow
-    ) {
-        CarPlayDiag.log("didConnect(3-arg) fired")
-        startOnce("didConnect(3-arg)") {
-            boot(interfaceController, window: window)
-        }
-    }
-
-    // iOS 13 variant, still the documented one for audio apps.
     func templateApplicationScene(
         _ scene: CPTemplateApplicationScene,
         didConnect interfaceController: CPInterfaceController
     ) {
         CarPlayDiag.log("didConnect(2-arg) fired")
         startOnce("didConnect(2-arg)") {
+            self.interfaceController = interfaceController
             boot(interfaceController, window: scene.carWindow)
         }
     }
@@ -116,23 +122,31 @@ extension CarPlaySceneDelegate {
     ) {
         CarPlayDiag.log("didDisconnect fired")
         didStart = false
+        interfaceController = nil
         CarPlayConnector.shared.didDisconnect()
     }
 
-    /// Install a placeholder root template first: if this shows up on the head unit
-    /// but the real tabs never do, the problem is inside CarPlayConnector, not the
-    /// scene plumbing.
-    private func boot(_ interfaceController: CPInterfaceController, window: CPWindow) {
-        CarPlayDiag.log("boot: installing placeholder root template")
+    private func boot(_ controller: CPInterfaceController, window: CPWindow) {
+        // Step 1: a plain list template. If this renders on the head unit, the scene
+        // plumbing is fine and the tab bar template is what upsets the host.
+        CarPlayDiag.log("step1: installing placeholder CPListTemplate")
         let placeholder = CPListTemplate(title: "Coda", sections: [])
         placeholder.emptyViewTitleVariants = ["Coda 正在连接…"]
-        interfaceController.setRootTemplate(placeholder, animated: false, completion: nil)
-        CarPlayDiag.log("boot: placeholder installed, handing over to CarPlayConnector")
+        controller.setRootTemplate(placeholder, animated: false, completion: nil)
+        CarPlayDiag.log("step1: placeholder installed")
 
-        CarPlayConnector.shared.didConnect(
-            interfaceController: interfaceController,
-            window: window
-        )
-        CarPlayDiag.log("boot: CarPlayConnector.didConnect returned")
+        // Step 2: hand over to the real connector, which installs a CPTabBarTemplate.
+        // Running it a few seconds later keeps the two experiments distinguishable in
+        // the log (and lets the placeholder paint first if the host survives).
+        CarPlayDiag.log("step2: scheduling CarPlayConnector in 5s")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard self?.interfaceController === controller else {
+                CarPlayDiag.log("step2: skipped, scene gone")
+                return
+            }
+            CarPlayDiag.log("step2: calling CarPlayConnector.didConnect")
+            CarPlayConnector.shared.didConnect(interfaceController: controller, window: window)
+            CarPlayDiag.log("step2: CarPlayConnector.didConnect returned")
+        }
     }
 }
