@@ -1,33 +1,43 @@
 name: CarPlay IPA
+
+# Builds the iOS IPA. CarPlay template support is deliberately NOT enabled in this
+# build: on iOS 16.5 the template session is silently dropped (setRootTemplate's
+# completion never fires) for an ad-hoc / TrollStore signature, which surfaces as a
+# black screen when the CarPlay icon is tapped. The Now Playing experience on the
+# head unit comes from MPNowPlayingInfoCenter and does not need the CarPlay scene.
+#
+# Version resolution only considers v* tags: publishing helper releases such as
+# "carplay-ipa-latest" must never leak into CFBundleShortVersionString, or the
+# in-app update check compares "0.1.2" against a non-numeric string and loops.
+
 on:
   push:
   workflow_dispatch:
     inputs:
       version:
-        description: "Marketing version (leave empty to use the latest tag)"
+        description: "Marketing version (leave empty to use the latest v* tag)"
         required: false
         default: ""
+
 permissions:
   contents: read
+
 jobs:
   build:
     runs-on: macos-26-intel
     timeout-minutes: 90
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Show toolchain
         run: |
           sw_vers
           xcodebuild -version
-      - name: Enable CarPlay overlay
-        run: |
-          chmod +x Scripts/*.sh || true
-          Scripts/configure-ios.sh --carplay
-          test -f "Sources/iOS&iPadOS/Config/Generated/CodaIOS-CarPlay.entitlements"
-          test -f "Sources/iOS&iPadOS/Config/Generated/Info-CarPlay.plist"
+
       - name: Resolve version
         id: v
         env:
@@ -35,13 +45,14 @@ jobs:
         run: |
           V="${INPUT_VERSION}"
           if [ -z "$V" ]; then
-            V="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
+            V="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//')"
           fi
           [ -n "$V" ] || V="0.1.2"
           B="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "build=$B" >> "$GITHUB_OUTPUT"
           echo "VERSION=$V BUILD=$B"
+
       - name: Build (unsigned)
         run: |
           set -o pipefail
@@ -57,37 +68,18 @@ jobs:
             MARKETING_VERSION="${{ steps.v.outputs.version }}" \
             CURRENT_PROJECT_VERSION="${{ steps.v.outputs.build }}" \
             build 2>&1 | tee build-xcodebuild.log | tail -n 40
-      - name: Ad-hoc sign with CarPlay entitlement
-        run: |
-          APP="$(ls -d build/dd/Build/Products/Release-iphoneos/*.app | head -n 1)"
-          ENT="Sources/iOS&iPadOS/Config/Generated/CodaIOS-CarPlay.entitlements"
-          echo "APP=$APP"
-          if [ -d "$APP/Frameworks" ]; then
-            find "$APP/Frameworks" \( -name '*.framework' -o -name '*.dylib' \) -print | while read -r item; do
-              codesign --force --sign - --timestamp=none "$item"
-            done
-          fi
-          codesign --force --sign - --timestamp=none --entitlements "$ENT" "$APP"
-          codesign --verify --verbose=2 "$APP"
-      - name: Verify CarPlay wiring
-        run: |
-          APP="$(ls -d build/dd/Build/Products/Release-iphoneos/*.app | head -n 1)"
-          PL="$APP/Info.plist"
-          codesign -d --entitlements :- "$APP" 2>&1 | tee /tmp/ent.txt
-          grep -q 'carplay-audio' /tmp/ent.txt || { echo "::error::carplay-audio missing from signature"; exit 1; }
-          /usr/libexec/PlistBuddy -c 'Print :UISupportsCarPlay' "$PL"
-          /usr/libexec/PlistBuddy -c 'Print :UISupportsCarPlay' "$PL" | grep -qi true
-          /usr/libexec/PlistBuddy -c 'Print :UIApplicationSceneManifest:UISceneConfigurations:CPTemplateApplicationSceneSessionRoleApplication:0:UISceneDelegateClassName' "$PL"
-          echo "CarPlay entitlement and scene declaration present"
+
       - name: Package IPA
         run: |
           APP="$(ls -d build/dd/Build/Products/Release-iphoneos/*.app | head -n 1)"
           V="${{ steps.v.outputs.version }}"
           mkdir -p out/payload/Payload
           ditto "$APP" "out/payload/Payload/$(basename "$APP")"
-          ( cd out/payload && zip -qry -X "../Coda-iOS-$V-carplay.ipa" Payload )
-          shasum -a 256 "out/Coda-iOS-$V-carplay.ipa"
+          ( cd out/payload && zip -qry -X "../Coda-iOS-$V.ipa" Payload )
           ls -lh out/
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :UISupportsCarPlay' "$APP/Info.plist" || echo "no CarPlay key (expected)"
+
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
@@ -95,6 +87,7 @@ jobs:
           path: out/*.ipa
           if-no-files-found: error
           retention-days: 14
+
       - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4
