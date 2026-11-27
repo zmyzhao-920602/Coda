@@ -122,7 +122,7 @@ extension CarPlaySceneDelegate {
     ) {
         CarPlayDiag.log("didDisconnect fired")
         didStart = false
-        interfaceController = nil
+        self.interfaceController = nil
         CarPlayConnector.shared.didDisconnect()
     }
 
@@ -139,8 +139,9 @@ extension CarPlaySceneDelegate {
         // Running it a few seconds later keeps the two experiments distinguishable in
         // the log (and lets the placeholder paint first if the host survives).
         CarPlayDiag.log("step2: scheduling CarPlayConnector in 5s")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            guard self?.interfaceController === controller else {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self, self.interfaceController === controller else {
                 CarPlayDiag.log("step2: skipped, scene gone")
                 return
             }
