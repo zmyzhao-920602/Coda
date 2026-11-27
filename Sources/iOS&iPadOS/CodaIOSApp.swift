@@ -8,15 +8,13 @@ struct CodaIOSApp: App {
     init() {
         CarPlayDiag.installExceptionHandler()
         let info = Bundle.main.infoDictionary
-        CarPlayDiag.log("app launched, version \(info?["CFBundleShortVersionString"] as? String ?? "?") build \(info?["CFBundleVersion"] as? String ?? "?")")
+        CarPlayDiag.log("=== app launched, version \(info?["CFBundleShortVersionString"] as? String ?? "?") build \(info?["CFBundleVersion"] as? String ?? "?") ===")
     }
 
     var body: some Scene {
         WindowGroup {
             IOSMainWindow()
-                .overlay(alignment: .topTrailing) {
-                    CarPlayDebugButton()
-                }
+                .overlay(alignment: .topTrailing) { CarPlayDebugButton() }
         }
     }
 }
@@ -30,8 +28,6 @@ final class DownloadAppDelegate: NSObject, UIApplicationDelegate {
 
 // MARK: - Diagnostics
 
-/// Plain-text log in the app's Documents folder, also viewable in-app through the
-/// stethoscope button (top-right) so it can be read without the Files app.
 enum CarPlayDiag {
     static let fileName = "carplay-diag.log"
 
@@ -69,9 +65,7 @@ struct CarPlayDebugButton: View {
     @State private var showing = false
 
     var body: some View {
-        Button {
-            showing = true
-        } label: {
+        Button { showing = true } label: {
             Image(systemName: "stethoscope")
                 .font(.system(size: 15, weight: .semibold))
                 .padding(9)
@@ -98,12 +92,8 @@ struct CarPlayDebugView: View {
             .navigationTitle("CarPlay 诊断")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("关闭") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("刷新") { text = CarPlayDiag.read() }
-                }
+                ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button("刷新") { text = CarPlayDiag.read() } }
             }
             .onAppear { text = CarPlayDiag.read() }
         }
@@ -115,13 +105,21 @@ struct CarPlayDebugView: View {
 import CarPlay
 import UIKit
 
-/// CarPlay template scene delegate.
+/// CarPlay template scene delegate — audio app variant (two-argument didConnect only).
 ///
-/// Only the two-argument `didConnect interfaceController:` variant is implemented:
-/// on iOS 16.5 the three-argument variant aborts inside CarPlay's own delivery step
-/// because audio apps have no CPWindow.
+/// v8 is a deliberate experiment: the head unit went black even though every callback
+/// fired and the connector returned normally. Two candidates remain:
+///
+///  a) CarPlay rejects the templates — `setRootTemplate` reports an error to its
+///     completion handler, which previous builds passed as nil and never observed;
+///  b) the placeholder list does render for a few seconds, then `CarPlayConnector`
+///     installs a CPTabBarTemplate and Apple's CarPlayTemplateUIHost crashes while
+///     building the tab bar (`-[UITabBar setDelegate:]` inside `_prepareTabBar`),
+///     which matches the first crash report we captured.
+///
+/// So this build installs ONLY the list template, logs the completion result, and
+/// never touches CarPlayConnector. If the head unit shows the list, (b) is confirmed.
 final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
-    /// `UIScene.delegate` is weak, and nothing in a SwiftUI lifecycle retains this object.
     nonisolated(unsafe) static var strongRetain: CarPlaySceneDelegate?
 
     private var didStart = false
@@ -133,9 +131,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         CarPlayDiag.log("CarPlaySceneDelegate init (retained)")
     }
 
-    deinit {
-        CarPlayDiag.log("CarPlaySceneDelegate deinit")
-    }
+    deinit { CarPlayDiag.log("CarPlaySceneDelegate deinit") }
 
     fileprivate func startOnce(_ label: String, _ body: () -> Void) {
         if didStart {
@@ -155,7 +151,7 @@ extension CarPlaySceneDelegate {
         CarPlayDiag.log("didConnect(2-arg) fired")
         startOnce("didConnect(2-arg)") {
             self.interfaceController = interfaceController
-            boot(interfaceController, window: scene.carWindow)
+            boot(interfaceController)
         }
     }
 
@@ -169,23 +165,31 @@ extension CarPlaySceneDelegate {
         CarPlayConnector.shared.didDisconnect()
     }
 
-    private func boot(_ controller: CPInterfaceController, window: CPWindow) {
-        CarPlayDiag.log("step1: installing placeholder CPListTemplate")
-        let placeholder = CPListTemplate(title: "Coda", sections: [])
-        placeholder.emptyViewTitleVariants = ["Coda 正在连接…"]
-        controller.setRootTemplate(placeholder, animated: false, completion: nil)
-        CarPlayDiag.log("step1: placeholder installed")
+    private func boot(_ controller: CPInterfaceController) {
+        let section = CPListSection(items: [
+            makeRow("list template works"),
+            makeRow("do not install the tab bar"),
+        ])
+        let list = CPListTemplate(title: "Coda", sections: [section])
+        list.emptyViewTitleVariants = ["Coda 列表模板已加载"]
 
-        CarPlayDiag.log("step2: scheduling CarPlayConnector in 5s")
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            guard let self, self.interfaceController === controller else {
-                CarPlayDiag.log("step2: skipped, scene gone")
-                return
+        CarPlayDiag.log("setRootTemplate: requesting (CPListTemplate)")
+        controller.setRootTemplate(list, animated: false) { ok, error in
+            if let error {
+                CarPlayDiag.log("setRootTemplate FAILED ok=\(ok) error=\(error.localizedDescription) \(String(describing: error))")
+            } else {
+                CarPlayDiag.log("setRootTemplate OK ok=\(ok) top=\(String(describing: controller.topTemplate))")
             }
-            CarPlayDiag.log("step2: calling CarPlayConnector.didConnect")
-            CarPlayConnector.shared.didConnect(interfaceController: controller, window: window)
-            CarPlayDiag.log("step2: CarPlayConnector.didConnect returned")
         }
+        CarPlayDiag.log("setRootTemplate: request handed to CarPlay")
+
+        // Deliberately no CarPlayConnector call: this build only answers whether a
+        // plain list template reaches the head unit.
+    }
+
+    private func makeRow(_ text: String) -> CPListItem {
+        let item = CPListItem(text: text, detailText: nil)
+        item.handler = { _, completion in completion() }
+        return item
     }
 }
