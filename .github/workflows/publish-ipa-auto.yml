@@ -1,15 +1,18 @@
-name: Publish IPA Auto
+name: Publish IPA
 
-# One-shot helper: republishes the already-built CarPlay IPA as a public Release
-# asset. Triggered by push, because the manual "Run workflow" dialog needs a
-# GitHub endpoint that is unreachable on this network.
+# Republishes a CarPlay IPA build as a public Release asset.
 #
-# Release assets are served from objects.githubusercontent.com (reachable),
-# unlike artifacts which redirect to pipelines.actions.githubusercontent.com
-# (blocked here).
+# Why: artifact downloads redirect to pipelines.actions.githubusercontent.com,
+# which is unreachable on this network, while release assets are served from
+# objects.githubusercontent.com, which works.
+#
+# Triggers automatically when "CarPlay IPA" finishes successfully.
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CarPlay IPA"]
+    types: [completed]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,16 +20,30 @@ permissions:
 
 jobs:
   publish:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - name: Download the artifact from the successful build run
+      - name: Resolve run id
+        id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            ID="${{ github.event.workflow_run.id }}"
+          else
+            ID=$(gh run list -R "${{ github.repository }}" --workflow carplay-ipa.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          fi
+          echo "resolved run id: $ID"
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifact
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p out
-          gh run download 45806991050 -R "${{ github.repository }}" -n coda-carplay-ipa -D out
+          gh run download "${{ steps.r.outputs.id }}" -R "${{ github.repository }}" -n coda-carplay-ipa -D out
           echo "--- files ---"
           find out -type f -exec ls -lh {} \;
 
@@ -34,11 +51,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="carplay-ipa-8392100"
+          TAG="carplay-ipa-latest"
           gh release delete "$TAG" -R "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" out/*.ipa \
             -R "${{ github.repository }}" \
             --title "Coda CarPlay IPA" \
-            --notes "CarPlay-enabled IPA (ad-hoc signed with com.apple.developer.carplay-audio). Install with TrollStore."
+            --notes "CarPlay-enabled IPA, ad-hoc signed with com.apple.developer.carplay-audio. Built from run ${{ steps.r.outputs.id }}. Install with TrollStore."
           echo "--- assets ---"
-          gh release view "$TAG" -R "${{ github.repository }}" --json assets --jq '.assets[] | "\(.name) \(.size)"'
+          gh release view "$TAG" -R "${{ github.repository }}" --json assets --jq '.assets[] | "\(.name) \(.size) bytes"'
